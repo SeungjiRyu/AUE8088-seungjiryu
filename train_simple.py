@@ -185,7 +185,7 @@ def train(hyp, opt, device, callbacks):
         gs,
         single_cls,
         hyp=hyp,
-        augment=False,      # TODO: make it work
+        augment=True,      # Augmentation is enabled
         cache=None if opt.cache == "val" else opt.cache,
         rect=opt.rect,
         rank=-1,

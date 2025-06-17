@@ -11,17 +11,27 @@
 path: datasets/kaist-rgbt
 train: # train files info (relative to 'path') 12,538 images
   - train-all-04.txt      # TODO: Please separate this file into train/val
+  # - train-custom.txt      # TODO: Please separate this file into train/val
 val: # val files info (relative to 'path')  12,538 images
   - test-all-20.txt
+  # - val-custom.txt
 test: # test files info (optional)
   - test-all-20.txt
 
 # Classes
 names:
   0: person
-  1: cyclist
-  2: people
-  3: person?
+  # 1: cyclist
+  # 2: people
+  # 3: person?
+
+
+              # if cls in ['people']:
+              #   continue
+              # if cls == 'person?':
+              #   cls = 'person' # merge person? to person
+              # if cls == 'cyclist':
+              #   cls = 'person' # merge cyclist to person
 
 # Download script/URL (optional) ---------------------------------------------------------------------------------------
 download: |
@@ -48,7 +58,10 @@ download: |
 
           for obj in root.iter('object'):
               cls = obj.find('name').text
-              xmlbox = obj.find('bndbox')
+              if cls in ['people', 'person?']:
+                  continue
+              if cls == 'cyclist':
+                cls = 'person' # merge cyclist to person
               bb = convert_box((w, h), [float(xmlbox.find(x).text) for x in ('x', 'y', 'w', 'h')])
               occ = int(obj.find('occlusion').text)
               cls_id = names.index(cls)  # class id

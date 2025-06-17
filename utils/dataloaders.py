@@ -800,7 +800,9 @@ class LoadImagesAndLabels(Dataset):
 
             labels = self.labels[index].copy()
             if labels.size:  # normalized xywh to pixel xyxy format
-                labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
+                # KAIST labels have 6 columns: [class, x_center, y_center, width, height, occlusion]
+                # Only transform the coordinate part (columns 1-4)
+                labels[:, 1:5] = xywhn2xyxy(labels[:, 1:5], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
 
             if self.augment:
                 img, labels = random_perspective(
@@ -1023,6 +1025,18 @@ class LoadImagesAndLabels(Dataset):
 
         return img9, labels9
 
+    def load_kaist_mosaic(self, index):
+        """KAIST 데이터셋을 위한 개별 증강 후 모자이크 로드 함수"""
+        from utils.augmentations import load_kaist_mosaic_with_individual_augmentation, apply_mosaic_final_augmentation_kaist
+        
+        # 개별 증강 후 모자이크 이미지와 라벨 생성
+        mosaic_imgs, mosaic_labels = load_kaist_mosaic_with_individual_augmentation(self, index, s=self.img_size//2)
+        
+        # 최종 증강 적용 (KAIST 비율로 리사이즈)
+        final_imgs, final_labels = apply_mosaic_final_augmentation_kaist(mosaic_imgs, mosaic_labels, self.hyp)
+        
+        return final_imgs, final_labels
+
     def img2label_paths(self, img_paths):
         """For compatibility with multispectral data"""
         return img2label_paths(img_paths)
@@ -1094,8 +1108,8 @@ class LoadRGBTImagesAndLabels(LoadImagesAndLabels):
 
         super().__init__(path, **kwargs)
 
-        # TODO: make mosaic augmentation work
-        self.mosaic = False
+        # Enable mosaic augmentation for KAIST dataset
+        self.mosaic = self.augment  # Enable mosaic when augmentation is enabled
 
         # Set ignore flag
         cond = self.ignore_settings['train' if is_train else 'test']
@@ -1198,86 +1212,170 @@ class LoadRGBTImagesAndLabels(LoadImagesAndLabels):
         index = self.indices[index]  # linear, shuffled, or image_weights
 
         hyp = self.hyp
-        mosaic = self.mosaic and random.random() < hyp["mosaic"]
+        # Apply mosaic with probability when augmentation is enabled (for KAIST RGBT dataset)
+        mosaic = self.mosaic and random.random() < hyp.get("mosaic", 1.0)
+        # print(f"Debug: Mosaic enabled: {self.mosaic}, Random check: {random.random() < hyp.get('mosaic', 1.0)}, Final mosaic: {mosaic}")
         if mosaic:
-            raise NotImplementedError('Please make "mosaic" augmentation work!')
-
-            # TODO: Load mosaic
-            img, labels = self.load_mosaic(index)
+            # Load KAIST mosaic
+            imgs, labels = self.load_kaist_mosaic(index)
             shapes = None
 
-            # TODO: MixUp augmentation
+            # MixUp augmentation
             if random.random() < hyp["mixup"]:
-                img, labels = mixup(img, labels, *self.load_mosaic(random.choice(self.indices)))
+                imgs2, labels2 = self.load_kaist_mosaic(random.choice(self.indices))
+                # Apply mixup to both thermal and visible images
+                r = np.random.beta(32.0, 32.0)  # mixup ratio
+                imgs[0] = (imgs[0] * r + imgs2[0] * (1 - r)).astype(np.uint8)  # thermal
+                imgs[1] = (imgs[1] * r + imgs2[1] * (1 - r)).astype(np.uint8)  # visible
+                labels = np.concatenate((labels, labels2), 0)
+
+            # Convert images to torch tensors
+            for ii, img in enumerate(imgs):
+                img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+                img = np.ascontiguousarray(img)
+                imgs[ii] = torch.from_numpy(img)
+
+            # Process labels for mosaic
+            nl = len(labels)
+            labels_out = torch.zeros((nl, 7))
+            if nl:
+                # Convert mosaic labels to proper YOLOv5 format
+                # The mosaic functions return labels in KAIST top-left format: [class, x_left_top, y_left_top, width, height, occlusion]
+                # print(f"Debug: Mosaic labels shape: {labels.shape}")
+                if labels.shape[1] >= 5:
+                    # Convert from KAIST top-left format to YOLOv5 center-based format
+                    if len(labels) > 0:
+                        # Extract coordinates (already normalized from mosaic function)
+                        x_left = labels[:, 1]    # x_left_top
+                        y_top = labels[:, 2]     # y_left_top  
+                        width = labels[:, 3]     # width
+                        height = labels[:, 4]    # height
+                        
+                        # Convert to center-based format using the same approach as test_specific_image.py
+                        x_center = x_left + width / 2   # x_center = x_left + width/2
+                        y_center = y_top + height / 2   # y_center = y_top + height/2
+                        
+                        # Create properly formatted labels [batch_idx, class, x_center, y_center, width, height]
+                        labels_formatted = np.zeros((len(labels), 6))
+                        labels_formatted[:, 0] = labels[:, 0]  # class
+                        labels_formatted[:, 1] = x_center     # x_center
+                        labels_formatted[:, 2] = y_center     # y_center
+                        labels_formatted[:, 3] = width        # width
+                        labels_formatted[:, 4] = height       # height
+                        
+                        # Clip coordinates to [0, 1] range
+                        labels_formatted[:, 1:5] = np.clip(labels_formatted[:, 1:5], 0, 1)
+                        
+                        # print(f"Debug: Converted mosaic labels from top-left to center format")
+                        # print(f"Debug: Sample conversion - Original: ({x_left[0]:.3f}, {y_top[0]:.3f}, {width[0]:.3f}, {height[0]:.3f})")
+                        # print(f"Debug: Sample conversion - Center: ({x_center[0]:.3f}, {y_center[0]:.3f}, {width[0]:.3f}, {height[0]:.3f})")
+                        
+                        labels_out[:, 1:] = torch.from_numpy(labels_formatted)
+                    else:
+                        labels_out[:, 1:] = torch.zeros((0, 6))
+                else:
+                    # print(f"Debug: Unexpected mosaic label format with {labels.shape[1]} columns")
+                    labels_out[:, 1:] = torch.from_numpy(labels)
 
         else:
             # Load image
             # hw0s: original shapes, hw1s: resized shapes
             imgs, hw0s, hw1s = self.load_image(index)
 
+            # Get original labels
+            labels = self.labels[index].copy()
+            
+            # Apply KAIST RGBT augmentation if enabled
+            if self.augment and len(labels) > 0:
+                from utils.augmentations import apply_kaist_rgbt_augmentation
+                
+                # KAIST labels are in top-left format [class, x_left_top, y_left_top, width, height, occlusion]
+                # Extract 5-column format for augmentation [class, x_left_top, y_left_top, width, height]
+                kaist_labels = labels[:, :5].copy()  # Exclude occlusion column
+                
+                # Apply KAIST RGBT augmentation using hyperparameters
+                thermal_img = imgs[0]  # thermal image
+                visible_img = imgs[1]  # visible image
+                
+                visible_aug, thermal_aug, labels_aug = apply_kaist_rgbt_augmentation(
+                    visible_img=visible_img,
+                    thermal_img=thermal_img, 
+                    labels=kaist_labels,
+                    flip_prob=hyp.get("fliplr", 0.5),  # Use hyperparameter for flip probability
+                    hsv_params=dict(
+                        hgain=hyp.get("hsv_h", 0.015),
+                        sgain=hyp.get("hsv_s", 0.7), 
+                        vgain=hyp.get("hsv_v", 0.4)
+                    ),
+                    shear_range=(-hyp.get("shear", 5), hyp.get("shear", 5))  # Use hyperparameter for shear range
+                )
+                
+                # Update images with augmented versions
+                imgs[0] = thermal_aug
+                imgs[1] = visible_aug
+                
+                # Convert augmented labels back to top-left format [class, x_left_top, y_left_top, width, height, occlusion]
+                if len(labels_aug) > 0:
+                    labels = np.zeros((len(labels_aug), 6))  # Include occlusion column
+                    labels[:, :5] = labels_aug  # Copy augmented labels (5 columns)
+                    labels[:, 5] = 0  # Set occlusion level to 0 for augmented labels
+                else:
+                    labels = np.zeros((0, 6))  # Empty labels with occlusion column
+
+            # Process each image through letterbox transformation
+            final_shapes = []
             for ii, (img, (h0, w0), (h, w)) in enumerate(zip(imgs, hw0s, hw1s)):
-                # Letterbox
+                # Letterbox with KAIST aspect ratio preservation
                 shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
-                img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
-                shapes = (h0, w0), (ratio, pad)  # for COCO mAP rescaling
-
-                labels = self.labels[index].copy()
-                if labels.size:  # normalized xywh to pixel xyxy format
-                    labels[:, 1:3] += labels[:, 3:5] / 2.0      # (x_lefttop, y_lefttop) -> (x_center, y_center)
-                    labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
-
-                if self.augment:
-                    raise NotImplementedError('Please make data augmentation work!')
-
-                    img, labels = random_perspective(
-                        img,
-                        labels,
-                        degrees=hyp["degrees"],
-                        translate=hyp["translate"],
-                        scale=hyp["scale"],
-                        shear=hyp["shear"],
-                        perspective=hyp["perspective"],
-                    )
-
-                nl = len(labels)  # number of labels
-                if nl:
-                    labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w=img.shape[1], h=img.shape[0], clip=True, eps=1e-3)
-
-                if self.augment:
-                    # Albumentations
-                    img, labels = self.albumentations(img, labels)
-                    nl = len(labels)  # update after albumentations
-
-                    # HSV color-space
-                    augment_hsv(img, hgain=hyp["hsv_h"], sgain=hyp["hsv_s"], vgain=hyp["hsv_v"])
-
-                    # Flip up-down
-                    if random.random() < hyp["flipud"]:
-                        img = np.flipud(img)
-                        if nl:
-                            labels[:, 2] = 1 - labels[:, 2]
-
-                    # Flip left-right
-                    if random.random() < hyp["fliplr"]:
-                        img = np.fliplr(img)
-                        if nl:
-                            labels[:, 1] = 1 - labels[:, 1]
-
-                    # Cutouts
-                    # labels = cutout(img, labels, p=0.5)
-                    # nl = len(labels)  # update after cutout
-
-                labels_out = torch.zeros((nl, 7))
-                if nl:
-                    labels_out[:, 1:] = torch.from_numpy(labels)
+                
+                # Convert shape to KAIST aspect ratio if needed
+                if isinstance(shape, int):
+                    # KAIST aspect ratio: 640:512 = 1.25:1
+                    target_h = int(shape * 512 / 640) if shape > 512 else shape
+                    kaist_shape = (target_h, shape)  # (height, width)
+                else:
+                    kaist_shape = shape
+                    
+                # Import letterbox_kaist function
+                from utils.augmentations import letterbox_kaist
+                img, ratio, pad = letterbox_kaist(img, kaist_shape, auto=False, scaleup=self.augment)
+                final_shapes.append((img.shape[:2], ratio, pad))  # Store shape info for each image
 
                 # Convert
                 img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
                 img = np.ascontiguousarray(img)
-
                 imgs[ii] = torch.from_numpy(img)
+            
+            # Use the shape from the first image (both thermal and visible should have same shape)
+            final_h, final_w = final_shapes[0][0]  # Height, width from letterbox
+            ratio = final_shapes[0][1]  # Ratio from letterbox
+            pad = final_shapes[0][2]  # Padding from letterbox
+            shapes = (hw0s[0], hw1s[0]), (ratio, pad)  # for COCO mAP rescaling (use first image info)
 
-        # Drop occlusion level
+            # Process labels - convert from KAIST top-left format to YOLOv5 center-based format
+            nl = len(labels)
+            if nl and labels.size > 0:
+                # KAIST labels are in normalized top-left format [class, x_left_top, y_left_top, width, height, occlusion]
+                # Since KAIST images are already 640x512 and letterbox maintains this ratio,
+                # we can directly convert coordinates without complex transformations
+                
+                # Convert from top-left to center-based format (keeping normalized coordinates)
+                x_center_norm = labels[:, 1] + labels[:, 3] / 2  # x_center = x_left + width/2
+                y_center_norm = labels[:, 2] + labels[:, 4] / 2  # y_center = y_top + height/2
+                
+                # Update labels to center-based format
+                labels[:, 1] = x_center_norm  # normalized x_center
+                labels[:, 2] = y_center_norm  # normalized y_center
+                # labels[:, 3] and labels[:, 4] remain the same (width, height)
+                
+                # Clip coordinates to [0, 1] range
+                labels[:, 1:5] = np.clip(labels[:, 1:5], 0, 1)
+
+            labels_out = torch.zeros((nl, 7))
+            if nl:
+                labels_out[:, 1:] = torch.from_numpy(labels)
+
+        # Drop occlusion level (keep only 6 columns: batch_idx, class, x_center, y_center, width, height)
         labels_out = labels_out[:, :-1]
         return imgs, labels_out, self.im_files[index], shapes, index
 
@@ -1304,10 +1402,23 @@ class LoadRGBTImagesAndLabels(LoadImagesAndLabels):
             img_shapes = []
             for i, img in enumerate(imgs):
                 h0, w0 = img.shape[:2]  # orig hw
-                r = self.img_size / max(h0, w0)  # ratio
+                
+                # KAIST 데이터셋의 경우 원본 비율 유지 (640x512)
+                # img_size가 640인 경우 height는 512로 설정
+                target_h = int(self.img_size * 512 / 640) if self.img_size > 512 else self.img_size
+                target_w = self.img_size
+                
+                # 비율 계산 (원본 비율 유지)
+                r_w = target_w / w0
+                r_h = target_h / h0
+                r = min(r_w, r_h)  # 작은 비율 사용하여 이미지가 잘리지 않도록
+                
                 if r != 1:  # if sizes are not equal
                     interp = cv2.INTER_LINEAR if (self.augment or r > 1) else cv2.INTER_AREA
-                    imgs[i] = cv2.resize(img, (math.ceil(w0 * r), math.ceil(h0 * r)), interpolation=interp)
+                    new_w = int(w0 * r)
+                    new_h = int(h0 * r)
+                    imgs[i] = cv2.resize(img, (new_w, new_h), interpolation=interp)
+                    
                 h0s.append(h0)
                 w0s.append(w0)
                 img_shapes.append(imgs[i].shape[:2])
@@ -1638,67 +1749,3 @@ class HUBDatasetStats:
                 pass
         print(f"Done. All images saved to {self.im_dir}")
         return self.im_dir
-
-
-# Classification dataloaders -------------------------------------------------------------------------------------------
-class ClassificationDataset(torchvision.datasets.ImageFolder):
-    """
-    YOLOv5 Classification Dataset.
-
-    Arguments
-        root:  Dataset path
-        transform:  torchvision transforms, used by default
-        album_transform: Albumentations transforms, used if installed
-    """
-
-    def __init__(self, root, augment, imgsz, cache=False):
-        """Initializes YOLOv5 Classification Dataset with optional caching, augmentations, and transforms for image
-        classification.
-        """
-        super().__init__(root=root)
-        self.torch_transforms = classify_transforms(imgsz)
-        self.album_transforms = classify_albumentations(augment, imgsz) if augment else None
-        self.cache_ram = cache is True or cache == "ram"
-        self.cache_disk = cache == "disk"
-        self.samples = [list(x) + [Path(x[0]).with_suffix(".npy"), None] for x in self.samples]  # file, index, npy, im
-
-    def __getitem__(self, i):
-        """Fetches and transforms an image sample by index, supporting RAM/disk caching and Augmentations."""
-        f, j, fn, im = self.samples[i]  # filename, index, filename.with_suffix('.npy'), image
-        if self.cache_ram and im is None:
-            im = self.samples[i][3] = cv2.imread(f)
-        elif self.cache_disk:
-            if not fn.exists():  # load npy
-                np.save(fn.as_posix(), cv2.imread(f))
-            im = np.load(fn)
-        else:  # read image
-            im = cv2.imread(f)  # BGR
-        if self.album_transforms:
-            sample = self.album_transforms(image=cv2.cvtColor(im, cv2.COLOR_BGR2RGB))["image"]
-        else:
-            sample = self.torch_transforms(im)
-        return sample, j
-
-
-def create_classification_dataloader(
-    path, imgsz=224, batch_size=16, augment=True, cache=False, rank=-1, workers=8, shuffle=True
-):
-    # Returns Dataloader object to be used with YOLOv5 Classifier
-    with torch_distributed_zero_first(rank):  # init dataset *.cache only once if DDP
-        dataset = ClassificationDataset(root=path, imgsz=imgsz, augment=augment, cache=cache)
-    batch_size = min(batch_size, len(dataset))
-    nd = torch.cuda.device_count()
-    nw = min([os.cpu_count() // max(nd, 1), batch_size if batch_size > 1 else 0, workers])
-    sampler = None if rank == -1 else distributed.DistributedSampler(dataset, shuffle=shuffle)
-    generator = torch.Generator()
-    generator.manual_seed(6148914691236517205 + RANK)
-    return InfiniteDataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle and sampler is None,
-        num_workers=nw,
-        sampler=sampler,
-        pin_memory=PIN_MEMORY,
-        worker_init_fn=seed_worker,
-        generator=generator,
-    )  # or DataLoader(persistent_workers=True)

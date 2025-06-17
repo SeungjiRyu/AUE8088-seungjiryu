@@ -8,11 +8,13 @@ from utils.metrics import bbox_iou
 from utils.torch_utils import de_parallel
 
 
+# Binary Cross Entropy with label smoothing
 def smooth_BCE(eps=0.1):
     """Returns label smoothing BCE targets for reducing overfitting; pos: `1.0 - 0.5*eps`, neg: `0.5*eps`. For details see https://github.com/ultralytics/yolov3/issues/238#issuecomment-598028441"""
     return 1.0 - 0.5 * eps, 0.5 * eps
 
-
+# Binary Cross Entropy with Logits Loss with reduced missing label effects
+# 실제로 객체가 있지만 라벨링되지 않은 경우, loss계산이 과도하게 커지는 것을 방지
 class BCEBlurWithLogitsLoss(nn.Module):
     # BCEwithLogitLoss() with reduced missing label effects.
     def __init__(self, alpha=0.05):
@@ -35,7 +37,7 @@ class BCEBlurWithLogitsLoss(nn.Module):
         loss *= alpha_factor
         return loss.mean()
 
-
+# Focal Loss, QFocal Loss: 객체 탐지 시에 배경과 객체 간의 불균형을 완화
 class FocalLoss(nn.Module):
     # Wraps focal loss around existing loss_fcn(), i.e. criteria = FocalLoss(nn.BCEWithLogitsLoss(), gamma=1.5)
     def __init__(self, loss_fcn, gamma=1.5, alpha=0.25):
@@ -99,6 +101,71 @@ class QFocalLoss(nn.Module):
         else:  # 'none'
             return loss
 
+# def bbox_iou_wiou(box1, box2, eps=1e-7):
+#     """
+#     WIoU v1 구현 (박스 위치, 크기, 비율 차이 반영하여 )
+#     box1, box2: [x, y, w, h] 형식
+#     """
+#     # IoU 계산
+#     b1_x1, b1_y1 = box1[:, 0] - box1[:, 2]/2, box1[:, 1] - box1[:, 3]/2
+#     b1_x2, b1_y2 = box1[:, 0] + box1[:, 2]/2, box1[:, 1] + box1[:, 3]/2
+#     b2_x1, b2_y1 = box2[:, 0] - box2[:, 2]/2, box2[:, 1] - box2[:, 3]/2
+#     b2_x2, b2_y2 = box2[:, 0] + box2[:, 2]/2, box2[:, 1] + box2[:, 3]/2
+
+#     inter = (torch.min(b1_x2, b2_x2) - torch.max(b1_x1, b2_x1)).clamp(0) * \
+#             (torch.min(b1_y2, b2_y2) - torch.max(b1_y1, b2_y1)).clamp(0)
+#     union = (b1_x2 - b1_x1) * (b1_y2 - b1_y1) + (b2_x2 - b2_x1) * (b2_y2 - b2_y1) - inter + eps
+#     iou = inter / union
+
+#     # 중심점 거리
+#     c_dist = (box1[:,0]-box2[:,0])**2 + (box1[:,1]-box2[:,1])**2
+    
+#     # 외접 박스 대각선 길이
+#     enclose_x1 = torch.min(b1_x1, b2_x1)
+#     enclose_y1 = torch.min(b1_y1, b2_y1)
+#     enclose_x2 = torch.max(b1_x2, b2_x2)
+#     enclose_y2 = torch.max(b1_y2, b2_y2)
+#     enclose_diag = (enclose_x2 - enclose_x1)**2 + (enclose_y2 - enclose_y1)**2 + eps
+    
+#     # 크기 차이
+#     w_diff = (box1[:,2] - box2[:,2])**2
+#     h_diff = (box1[:,3] - box2[:,3])**2
+
+#     return 1 - iou + (c_dist + w_diff + h_diff)/enclose_diag
+
+class WIoU_Calculator:
+    def __init__(self, momentum=0.999):
+        self.momentum = momentum
+        self.running_mean = 0.4  # L_IoU 
+
+    def update(self, batch_iou):
+        self.running_mean = self.momentum * self.running_mean + (1 - self.momentum) * batch_iou.mean().item()
+
+    def __call__(self, pred, target):
+        # IoU
+        inter_x1 = torch.max(pred[:,0]-pred[:,2]/2, target[:,0]-target[:,2]/2)
+        inter_y1 = torch.max(pred[:,1]-pred[:,3]/2, target[:,1]-target[:,3]/2)
+        inter_x2 = torch.min(pred[:,0]+pred[:,2]/2, target[:,0]+target[:,2]/2)
+        inter_y2 = torch.min(pred[:,1]+pred[:,3]/2, target[:,1]+target[:,3]/2)
+        
+        inter_area = torch.clamp(inter_x2 - inter_x1, min=0) * torch.clamp(inter_y2 - inter_y1, min=0)
+        union = pred[:,2]*pred[:,3] + target[:,2]*target[:,3] - inter_area
+        iou = inter_area / (union + 1e-7)
+
+        # WIoU v1 elements
+        center_dist = (pred[:,0] - target[:,0])**2 + (pred[:,1] - target[:,1])**2
+        enclose_x1 = torch.min(pred[:,0]-pred[:,2]/2, target[:,0]-target[:,2]/2)
+        enclose_y1 = torch.min(pred[:,1]-pred[:,3]/2, target[:,1]-target[:,3]/2)
+        enclose_x2 = torch.max(pred[:,0]+pred[:,2]/2, target[:,0]+target[:,2]/2)
+        enclose_y2 = torch.max(pred[:,1]+pred[:,3]/2, target[:,1]+target[:,3]/2)
+        enclose_diag = (enclose_x2 - enclose_x1)**2 + (enclose_y2 - enclose_y1)**2 + 1e-7
+
+        # Gradient gain
+        beta = (1 - iou) / (1 - self.running_mean + 1e-7)
+        beta = beta.clamp(min=1e-3, max=10.0)  
+        r = 4.0 / (1.6 ** (beta - 4.0 + 1e-7))  # α=1.6, δ=4 (Default), 1.6^(beta-4.0)
+
+        return torch.mean(r * (1 - iou + (center_dist + 1) / enclose_diag))
 
 class ComputeLoss:
     sort_obj_iou = False
@@ -130,6 +197,7 @@ class ComputeLoss:
         self.nl = m.nl  # number of layers
         self.anchors = m.anchors
         self.device = device
+        self.wiou = WIoU_Calculator() # Initialize WIoU calculator
 
     def __call__(self, p, targets):  # predictions, targets
         """Performs forward pass, calculating class, box, and object loss for given predictions and targets."""
@@ -152,8 +220,15 @@ class ComputeLoss:
                 pxy = pxy.sigmoid() * 2 - 0.5
                 pwh = (pwh.sigmoid() * 2) ** 2 * anchors[i]
                 pbox = torch.cat((pxy, pwh), 1)  # predicted box
-                iou = bbox_iou(pbox, tbox[i], CIoU=True).squeeze()  # iou(prediction, target)
-                lbox += (1.0 - iou).mean()  # iou loss
+                # iou = bbox_iou(pbox, tbox[i], CIoU=True).squeeze()  # iou(prediction, target)
+                # lbox += (1.0 - iou).mean()  # iou loss
+                wiou_loss = self.wiou(pbox, tbox[i])  # WIoU loss
+                lbox += wiou_loss
+                
+                # Update WIoU running mean
+                with torch.no_grad():
+                    iou = bbox_iou(pbox, tbox[i], CIoU=False).squeeze()
+                    self.wiou.update(iou)
 
                 # Objectness
                 iou = iou.detach().clamp(0).type(tobj.dtype)
@@ -162,6 +237,13 @@ class ComputeLoss:
                     b, a, gj, gi, iou = b[j], a[j], gj[j], gi[j], iou[j]
                 if self.gr < 1:
                     iou = (1.0 - self.gr) + self.gr * iou
+
+                # # If prediction is matched (iou > 0.5) with bounding box marked as ignore,
+                # # do not calculate objectness loss
+                # ign_idx = (tcls[i] == -1) & (iou > self.hyp["iou_t"])
+                # keep = ~ign_idx
+                
+                # b, a, gj, gi, iou = b[keep], a[keep], gj[keep], gi[keep], iou[keep]
 
                 tobj[b, a, gj, gi] = iou  # iou ratio
 
@@ -220,33 +302,14 @@ class ComputeLoss:
             gain[2:6] = torch.tensor(shape)[[3, 2, 3, 2]]  # xyxy gain
 
             # Match targets to anchors
-            t = targets * gain  # shape(3,n,7)
+            t = targets * gain  # shape(3,n,7)                
+            
             if nt:
                 # Matches
                 r = t[..., 4:6] / anchors[:, None]  # wh ratio
                 j = torch.max(r, 1 / r).max(2)[0] < self.hyp["anchor_t"]  # compare
                 # j = wh_iou(anchors, t[:, 4:6]) > model.hyp['iou_t']  # iou(3,n)=wh_iou(anchors(3,2), gwh(n,2))
                 t = t[j]  # filter
-                
-                # Filter out objects with invalid aspect ratios
-                # Target format after filtering: [image, class, x, y, w, h, anchor_index]
-                if len(t) > 0:
-                    box_w = t[:, 4]  # width of all objects
-                    box_h = t[:, 5]  # height of all objects
-                    
-                    # Filter out objects where width/height > 3 (too wide)
-                    aspect_ratio = box_w / (box_h + 1e-6)  # add small epsilon to avoid division by zero
-                    valid_aspect_ratio = aspect_ratio <= 3.0  # keep objects with aspect ratio <= 3:1
-                    
-                    # Additional filter for 'people' class (class 2) where width >= height
-                    people_mask = t[:, 1] == 2  # 'people' class
-                    if people_mask.any():
-                        valid_people = box_h[people_mask] > box_w[people_mask]  # height > width for valid people
-                        # Update valid mask for people class
-                        valid_aspect_ratio[people_mask] = valid_aspect_ratio[people_mask] & valid_people
-                    
-                    # Apply combined filter
-                    t = t[valid_aspect_ratio]
 
                 # Offsets
                 gxy = t[:, 2:4]  # grid xy
